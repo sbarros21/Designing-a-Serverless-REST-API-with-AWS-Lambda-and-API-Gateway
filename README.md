@@ -101,3 +101,68 @@ and a human-readable `message`. The format must be consistent across the whole A
 come with the correct HTTP status code. It must **never** expose stack traces, secrets
 or internal details. As an improvement, it could include a `traceId` to correlate the
 error with logs.
+
+
+## 2. Checkpoint 1 — Plain Java application
+
+**Can the application functionality be tested without AWS?**
+Yes. `OrderService` is plain Java and is fully tested with JUnit (`mvn test`),
+with no AWS account, credentials or network access.
+
+**Does the application require a web server?**
+No. There is no Tomcat, Jetty or any HTTP listener; the logic is invoked as
+ordinary Java method calls.
+
+**Does it require Spring Boot?**
+No. The only dependency is JUnit, and only in test scope.
+
+**What does the generated JAR contain?**
+Only our compiled classes (`model`, `repository`, `service`) and the Maven
+manifest/metadata. It contains no third-party libraries and no test classes.
+
+**Which parts of the application currently know about HTTP?**
+None. Business outcomes are expressed with domain exceptions
+(`OrderNotFoundException`, `InvalidOrderException`), not with status codes.
+Translating them into HTTP responses will be the responsibility of a later
+layer (API Gateway or an HTTP adapter).
+
+Verified against the deployed function (`orders-create`):
+
+| Event | Result | Conclusion |
+|---|---|---|
+| `{"customerId":"CUST-42","product":"MacBook Air","quantity":1}` | `{"id":"ORD-004",...}` (with *Init duration* ≈ 385 ms) | JSON → `CreateOrderRequest` → `Order` → JSON. First call was a cold start. |
+| `{"customerId":"CUST-100","product":"Monitor","quantity":3}` | `{"id":"ORD-004",...}` | The execution environment had been recycled: in-memory data was reset to the sample orders. |
+| `{"customerId":"CUST-1","product":"Mouse","quantity":1,"color":"red"}` | `{"id":"ORD-005",...}` | Unknown JSON properties are silently ignored. The environment was warm, so the counter was preserved. |
+| `{"customerId":"CUST-42","product":"MacBook Air","quantity":0}` | `errorType: InvalidOrderException`, `errorMessage: "quantity must be..."`, full `stackTrace` | Exceptions thrown by our code become a Lambda error document. The stack trace (`Method.invoke`) confirms the handler is invoked via reflection. It also exposes internals, so it must not reach API clients as-is. |
+| `{"customerId":"CUST-1","product":"Mouse","quantity":"two"}` | `errorType: RuntimeException`, `errorMessage: "An error occurred during JSON parsing"`, empty `stackTrace` | Deserialization fails **before** our code runs; our validation is never reached. Type errors and business validation errors are reported differently. |
+
+**Conclusion:** the Lambda Java runtime acts as an automatic JSON adapter. It
+deserializes the event into the handler's parameter type by matching property
+names (ignoring unknown ones and leaving missing ones as `null`), invokes the
+method via reflection, and serializes the return value with its getters.
+Errors, whether from our code or from deserialization, are returned as an
+`errorMessage` / `errorType` / `stackTrace` document. Because the execution
+environment can be recycled at any time, the in-memory repository is not
+persistent storage.
+
+## Part II — AWS Lambda
+
+Verified against the deployed function (`orders-create`):
+
+| Event | Result | Conclusion |
+|---|---|---|
+| `{"customerId":"CUST-42","product":"MacBook Air","quantity":1}` | `{"id":"ORD-004",...}` (with *Init duration* ≈ 385 ms) | JSON → `CreateOrderRequest` → `Order` → JSON. First call was a cold start. |
+| `{"customerId":"CUST-100","product":"Monitor","quantity":3}` | `{"id":"ORD-004",...}` | The execution environment had been recycled: in-memory data was reset to the sample orders. |
+| `{"customerId":"CUST-1","product":"Mouse","quantity":1,"color":"red"}` | `{"id":"ORD-005",...}` | Unknown JSON properties are silently ignored. The environment was warm, so the counter was preserved. |
+| `{"customerId":"CUST-42","product":"MacBook Air","quantity":0}` | `errorType: InvalidOrderException`, `errorMessage: "quantity must be..."`, full `stackTrace` | Exceptions thrown by our code become a Lambda error document. The stack trace (`Method.invoke`) confirms the handler is invoked via reflection. It also exposes internals, so it must not reach API clients as-is. |
+| `{"customerId":"CUST-1","product":"Mouse","quantity":"two"}` | `errorType: RuntimeException`, `errorMessage: "An error occurred during JSON parsing"`, empty `stackTrace` | Deserialization fails **before** our code runs; our validation is never reached. Type errors and business validation errors are reported differently. |
+
+**Conclusion:** the Lambda Java runtime acts as an automatic JSON adapter. It
+deserializes the event into the handler's parameter type by matching property
+names (ignoring unknown ones and leaving missing ones as `null`), invokes the
+method via reflection, and serializes the return value with its getters.
+Errors, whether from our code or from deserialization, are returned as an
+`errorMessage` / `errorType` / `stackTrace` document. Because the execution
+environment can be recycled at any time, the in-memory repository is not
+persistent storage.
+
