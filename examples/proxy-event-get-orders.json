@@ -1,0 +1,55 @@
+{
+  "resource": "/orders",
+  "path": "/orders",
+  "httpMethod": "GET",
+  "headers": {
+    "User-Agent": "workshop-test",
+    "Accept": "application/json"
+  },
+  "multiValueHeaders": {
+    "User-Agent": ["workshop-test"],
+    "Accept": ["application/json"]
+  },
+  "queryStringParameters": {
+    "customerId": "CUST-42"
+  },
+  "multiValueQueryStringParameters": {
+    "customerId": ["CUST-42"]
+  },
+  "pathParameters": null,
+  "stageVariables": null,
+  "requestContext": {
+    "resourceId": "ysulet",
+    "resourcePath": "/orders",
+    "httpMethod": "GET",
+    "extendedRequestId": "FxrjYFieIAMFcgA=",
+    "requestTime": "25/Oct/2026:01:20:08 +0000",
+    "path": "/orders",
+    "accountId": "XXXXXXXXXXXX",
+    "protocol": "HTTP/1.1",
+    "stage": "test-invoke-stage",
+    "domainPrefix": "testPrefix",
+    "requestTimeEpoch": 1792891208303,
+    "requestId": "33b2c45d-1029-497c-bd19-71e3766ecad2",
+    "identity": {
+      "cognitoIdentityPoolId": null,
+      "cognitoIdentityId": null,
+      "apiKey": "test-invoke-api-key",
+      "principalOrgId": null,
+      "cognitoAuthenticationType": null,
+      "userArn": "arn:aws:sts::XXXXXXXXXXXX:assumed-role/voclabs/XXXX",
+      "apiKeyId": "test-invoke-api-key-id",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0",
+      "accountId": "XXXXXXXXXXXX",
+      "caller": "XXXX",
+      "sourceIp": "test-invoke-source-ip",
+      "accessKey": "XXXX",
+      "cognitoAuthenticationProvider": null,
+      "user": "XXXX"
+    },
+    "domainName": "testPrefix.testDomainName",
+    "apiId": "y1r8o51kka"
+  },
+  "body": null,
+  "isBase64Encoded": false
+}

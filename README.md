@@ -175,7 +175,7 @@ transforms the HTTP request into the JSON expected by the function and
 transforms the function's result (or error) into an HTTP response.
 
 Full exported configuration (resources, methods, mapping templates and
-selection patterns): [`docs/api-gateway/orders-api-mapping-oas30-apigateway.json`](docs/api-gateway/orders-api-mapping-oas30-apigateway.json)
+selection patterns): [`docs/api-gateway/orders-api-mapping-dev-oas30-apigateway.json`](docs/api-gateway/orders-api-mapping-dev-oas30-apigateway.json)
 
 | Method & resource | Lambda | Request mapping template (`application/json`) |
 |---|---|---|
@@ -288,3 +288,157 @@ In Architecture A, API Gateway is responsible for:
 - **Repetitive configuration:** every method repeats method responses, integration responses and templates. With 3 operations this is already about 15 manual console steps.
 - **Configuration lives in the console**, not in source control, unless it is explicitly exported (as done here). Manual steps are error-prone; during the workshop a template was accidentally edited on the wrong method.
 - **One Lambda per method** means no shared in-memory state between operations.
+
+
+## Part V — Lambda Proxy Integration (Architecture B)
+
+REST API `orders-api-proxy` (Regional), stage `dev`. All three methods use
+**Lambda proxy integration** with a **single** Lambda function, `orders-api`
+(handler `co.edu.escuelaing.orders.http.OrdersApiHandler::handleRequest`,
+Java 17, timeout 10 s).
+
+API Gateway performs no transformation: it forwards the whole HTTP request as
+an event and returns whatever status code, headers and body the handler
+produces. Exported configuration:
+[`docs/api-gateway/orders-api-proxy-dev-oas30-apigateway.json`](docs/api-gateway/orders-api-proxy-dev-oas30-apigateway.json)
+
+### The proxy event
+
+A real event captured from API Gateway (sensitive values redacted):
+[`examples/proxy-event-get-orders.json`](examples/proxy-event-get-orders.json)
+
+| Information | Where it appears in the event |
+|---|---|
+| HTTP method | `httpMethod` (also `requestContext.httpMethod`) |
+| Path | `path` = actual path (`/orders/ORD-001`); `resource` = route template (`/orders/{id}`) |
+| Path parameters | `pathParameters` (`{"id": "ORD-001"}`), `null` when there are none |
+| Query parameters | `queryStringParameters` (`{"customerId": "CUST-42"}`) and `multiValueQueryStringParameters`, `null` when there are none |
+| Headers | `headers` and `multiValueHeaders` |
+| Request body | `body`, **as a string** (or `null`), with `isBase64Encoded` |
+
+The handler must return
+`{"statusCode": ..., "headers": {...}, "body": "<string>"}`, which API Gateway
+unwraps into the HTTP response.
+
+> Observed during setup: when a method was accidentally left **without** proxy
+> integration, Lambda received an empty event (`No route for null null`) and
+> API Gateway returned the handler's whole response object as text with status
+> 200. With proxy enabled, the same handler produced the correct status code.
+
+### HTTP adapter
+
+```
+API Gateway ──event──▶ OrdersApiHandler ──Java calls──▶ OrderService
+                         (AWS + HTTP)                    (plain Java, unchanged)
+```
+
+`OrdersApiHandler` is the **only** class that knows about API Gateway events,
+status codes, headers and JSON. It:
+1. **routes** by `httpMethod` + `resource`;
+2. **extracts** `pathParameters`, `queryStringParameters` and parses `body` with Jackson;
+3. **calls** `OrderService`;
+4. **translates** the outcome: success → 200/201 (+ `Location`),
+   `InvalidOrderException` or malformed JSON → 400,
+   `OrderNotFoundException` → 404, anything else → 500 (logged, never exposed).
+
+`OrderService`, the repository and the model were **not modified**. All HTTP
+behavior is covered by `OrdersApiHandlerTest` (13 tests, no AWS needed),
+including the 500 case, which could not be tested locally in Architecture A.
+
+### Example requests and responses
+
+Base URL: `https://y1r8o51kka.execute-api.us-east-1.amazonaws.com/dev`
+
+| Request | Status | Body |
+|---|---|---|
+| `GET /orders/ORD-001` | `200 OK` | `{"id":"ORD-001","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+| `GET /orders/ORD-999` | `404 Not Found` | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-999 does not exist"}` |
+| `GET /orders?customerId=CUST-42` | `200 OK` | `[{"id":"ORD-001",...},{"id":"ORD-002",...}]` |
+| `GET /orders?customerId=CUST-100` | `200 OK` | `[]` |
+| `GET /orders` | `400 Bad Request` | `{"error":"INVALID_REQUEST","message":"customerId is required"}` |
+| `POST /orders` ([body](examples/create-order.json)) | `201 Created` + `Location: /orders/ORD-004` | `{"id":"ORD-004","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+| `POST /orders` ([body](examples/create-order-invalid.json)) | `400 Bad Request` | `{"error":"INVALID_REQUEST","message":"quantity must be an integer greater than or equal to 1"}` |
+| `POST /orders` ([body](examples/create-order-wrong-type.json)) | `400 Bad Request` | `{"error":"INVALID_REQUEST","message":"Request body is not valid JSON or has fields with invalid types"}` |
+| `GET /orders/ORD-004` (just created) | `200 OK` | `{"id":"ORD-004",...}` |
+
+The last request shows a difference from Architecture A: since all operations
+run in the same function, an order created by `POST` is visible to `GET`
+while the execution environment stays warm. It is still not persistent.
+
+## Comparing the Two Architectures
+
+| | Architecture A (mapping templates) | Architecture B (proxy + adapter) |
+|---|---|---|
+| Lambda functions | 3 (one per operation) | 1 (whole API) |
+| API Gateway config per method | request template + method responses + integration responses (regex) + response templates | proxy toggle only |
+| HTTP logic lives in | API Gateway (VTL, console) | `OrdersApiHandler` (Java, Git) |
+| Status codes defined in | method/integration responses, regex, `responseOverride` | `OrdersApiHandler` |
+| Locally testable | business logic only | business logic **and** HTTP behavior |
+| AWS dependencies in Java | none | only in `http` package |
+
+**Which approach required more API Gateway configuration?**
+Architecture A, by far. Each method needed a request mapping template, declared
+method responses, one integration response per status code with a regex over
+`errorMessage`, and a response template for each one. Architecture B needed only
+the resources and three methods with the proxy toggle enabled. The exported
+OpenAPI file of B is much shorter than A's.
+
+**Which approach required more Java infrastructure code?**
+Architecture B. It needs `OrdersApiHandler` (routing, parameter extraction, JSON
+parsing, status codes, headers), `ErrorResponse`, AWS and Jackson dependencies,
+and a fat JAR (shade plugin). Architecture A only needed the thin `OrderFunctions`
+entry point plus `FunctionError` for the error-prefix convention.
+
+**Which was easier to test locally?**
+Architecture B. Its entire HTTP behavior, including 400/404/500, the `Location`
+header, malformed JSON and unknown routes, is covered by JUnit tests that build
+`APIGatewayProxyRequestEvent` objects by hand. In A, the mapping templates and
+regexes could only be tested in AWS; a template error (arithmetic inside a VTL
+method call) was only discovered there.
+
+**Where are HTTP status codes defined in each approach?**
+- **A:** in API Gateway. Method responses declare them, integration-response
+  regexes select them, and `POST` forces 201 through
+  `$context.responseOverride.status` in a template. The Java code only emits a
+  `[CODE]` prefix that the gateway interprets.
+- **B:** in Java, in `OrdersApiHandler.handleRequest` (exception → status) and
+  in each operation (`json(201, ...)`).
+
+**What happens if the API grows from 3 operations to 30?**
+- **A:** configuration grows linearly and manually: about 30 request templates and
+  over 100 integration responses with regexes and templates. With one Lambda per
+  operation, that means 30 functions that share no state, each to deploy. Done in
+  the console, this is error-prone (during this workshop a template was edited on
+  the wrong method); it would require infrastructure as code (SAM, CDK, Terraform
+  or an OpenAPI definition) to stay manageable.
+- **B:** API Gateway config stays trivial (or a single `{proxy+}` / `ANY` route),
+  but the handler's `if` chain would become a large router. It would need a
+  proper routing table or a lightweight framework, or splitting the API into
+  several Lambdas per bounded context. Deploying a change to one route
+  redeploys the whole function.
+
+**Which approach makes the Java business logic cleaner?**
+Neither changes it: `OrderService` is identical in both, which was the goal of
+Part I. The difference is the adapter layer. In A the Java entry point is
+AWS-free, but it still has to follow a gateway convention hidden in strings (the
+`[CODE]` prefix). In B, AWS and HTTP concerns are explicit and confined to one
+class (`http` package). B's boundary is more honest; A's Java looks cleaner, but
+part of its logic lives elsewhere.
+
+**Which approach would be easier for another developer to understand?**
+Architecture B. All the behavior of an endpoint can be read in one place, in
+the IDE, under version control, with tests documenting it. In A, understanding
+`POST /orders` requires reading Java, a request template, a default response
+template with a status override and three regex-selected error templates in the
+console (or in a long exported OpenAPI file).
+
+**Which approach would you choose for a larger system? Why?**
+Architecture B, with some boundaries. Keep a thin HTTP adapter per service (or
+per bounded context, not necessarily one Lambda for everything), define the
+gateway with infrastructure as code, and keep business logic in plain Java as
+done here. API Gateway should keep the responsibilities it is good at: TLS,
+routing, authentication (JWT authorizers), throttling, CORS, logging. Business
+decisions and HTTP translation stay in versioned, testable code. This matches the
+idea that the gateway protects and routes while services own business decisions.
+Architecture A remains useful for small, stable transformations or when
+integrating API Gateway directly with AWS services without writing a Lambda.
