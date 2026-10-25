@@ -77,6 +77,9 @@ public class OrdersApiHandler
         if ("GET".equals(method) && "/orders/{id}".equals(resource)) {
             return getOrder(event);
         }
+        if ("DELETE".equals(method) && "/orders/{id}".equals(resource)) {
+            return deleteOrder(event);
+        }
         return error(404, "ROUTE_NOT_FOUND", "No route for " + method + " " + event.getPath());
     }
 
@@ -103,6 +106,14 @@ public class OrdersApiHandler
         String customerId = param(event.getQueryStringParameters(), "customerId");
         List<Order> orders = service.getOrdersByCustomer(customerId);
         return json(200, orders, Map.of());
+    }
+
+    private APIGatewayProxyResponseEvent deleteOrder(APIGatewayProxyRequestEvent event) {
+        service.deleteOrder(param(event.getPathParameters(), "id"));
+        // 204 No Content: success, and intentionally no body.
+        return new APIGatewayProxyResponseEvent()
+                .withStatusCode(204)
+                .withHeaders(new HashMap<>());
     }
 
     // ---------- helpers ----------
@@ -138,4 +149,6 @@ public class OrdersApiHandler
             throw new IllegalStateException("Could not serialize response", e);
         }
     }
+
+
 }

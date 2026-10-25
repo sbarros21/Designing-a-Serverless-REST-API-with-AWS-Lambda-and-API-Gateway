@@ -470,3 +470,15 @@ In AWS.
 - **Which tests should be added?** 
 
 Multiple ones to test different cases when you try to delete things, to prove you can successfully delete, but also what happens when you try to delete something that doesn't exist and so on.
+
+
+### Observed while deploying
+
+1. Before the `DELETE` method was available in the deployed stage, API Gateway
+   answered `403 {"message":"Missing Authentication Token"}`. That is API
+   Gateway's response for an undeclared method/route, and the request never
+   reached Lambda. This confirms that the gateway configuration had to change.
+2. With the method deployed but the old JAR still in Lambda, the request reached
+   `OrdersApiHandler`, which answered `404 ROUTE_NOT_FOUND`. Uploading the new
+   JAR fixed it. In Architecture B, a new operation needs **both** a gateway
+   route and a code change in the adapter.

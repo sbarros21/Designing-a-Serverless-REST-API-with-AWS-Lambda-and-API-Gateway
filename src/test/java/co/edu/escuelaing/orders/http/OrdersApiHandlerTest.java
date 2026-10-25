@@ -178,4 +178,41 @@ class OrdersApiHandlerTest {
         assertEquals("INTERNAL_ERROR", body(response).get("error").asText());
         assertFalse(response.getBody().contains("database exploded"));
     }
+
+    private static APIGatewayProxyRequestEvent delete(String id) {
+        return new APIGatewayProxyRequestEvent()
+                .withHttpMethod("DELETE").withResource("/orders/{id}").withPath("/orders/" + id)
+                .withPathParameters(Map.of("id", id));
+    }
+
+    // ---------- DELETE /orders/{id} ----------
+
+    @Test
+    void deleteExistingOrderReturns204WithoutBody() {
+        APIGatewayProxyResponseEvent response = call(delete("ORD-001"));
+
+        assertEquals(204, response.getStatusCode());
+        assertNull(response.getBody());
+    }
+
+    @Test
+    void deletedOrderIsNoLongerRetrievable() {
+        call(delete("ORD-001"));
+
+        assertEquals(404, call(getById("ORD-001")).getStatusCode());
+    }
+
+    @Test
+    void deleteMissingOrderReturns404() throws Exception {
+        APIGatewayProxyResponseEvent response = call(delete("ORD-999"));
+
+        assertEquals(404, response.getStatusCode());
+        assertEquals("ORDER_NOT_FOUND", body(response).get("error").asText());
+    }
+
+    @Test
+    void deletingTwiceReturns404TheSecondTime() {
+        assertEquals(204, call(delete("ORD-002")).getStatusCode());
+        assertEquals(404, call(delete("ORD-002")).getStatusCode());
+    }
 }

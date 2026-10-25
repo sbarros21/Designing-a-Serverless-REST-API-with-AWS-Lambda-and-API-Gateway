@@ -48,4 +48,9 @@ public class InMemoryOrderRepository implements OrderRepository {
                 .filter(order -> order.getCustomerId().equals(customerId))
                 .collect(Collectors.toList());
     }
+
+    @Override
+    public boolean deleteById(String id) {
+        return orders.remove(id) != null;
+    }
 }

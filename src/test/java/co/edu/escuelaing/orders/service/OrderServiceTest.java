@@ -129,4 +129,35 @@ class OrderServiceTest {
         assertThrows(InvalidOrderException.class,
                 () -> service.createOrder(new CreateOrderRequest("CUST-42", "MacBook Air", quantity)));
     }
+
+    // ---------- delete ----------
+
+    @Test
+    void deletesExistingOrder() {
+        service.deleteOrder("ORD-001");
+
+        assertThrows(OrderNotFoundException.class, () -> service.getOrder("ORD-001"));
+    }
+
+    @Test
+    void deletedOrderNoLongerAppearsInCustomerSearch() {
+        service.deleteOrder("ORD-001");
+
+        assertEquals(1, service.getOrdersByCustomer("CUST-42").size());
+    }
+
+    @Test
+    void deletingMissingOrderThrowsNotFound() {
+        OrderNotFoundException ex = assertThrows(OrderNotFoundException.class,
+                () -> service.deleteOrder("ORD-999"));
+
+        assertEquals("Order ORD-999 does not exist", ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {"   "})
+    void rejectsBlankIdOnDelete(String id) {
+        assertThrows(InvalidOrderException.class, () -> service.deleteOrder(id));
+    }
 }
