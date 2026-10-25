@@ -166,3 +166,125 @@ Errors, whether from our code or from deserialization, are returned as an
 environment can be recycled at any time, the in-memory repository is not
 persistent storage.
 
+
+## Part III & IV — API Gateway Mapping (Architecture A)
+
+REST API `orders-api-mapping` (Regional), stage `dev`, **non-proxy Lambda
+integration**. Each method invokes its own Lambda function; API Gateway
+transforms the HTTP request into the JSON expected by the function and
+transforms the function's result (or error) into an HTTP response.
+
+Full exported configuration (resources, methods, mapping templates and
+selection patterns): [`docs/api-gateway/orders-api-mapping-oas30-apigateway.json`](docs/api-gateway/orders-api-mapping-oas30-apigateway.json)
+
+| Method & resource | Lambda | Request mapping template (`application/json`) |
+|---|---|---|
+| `GET /orders/{id}` | `orders-get` | `{"id": "$util.escapeJavaScript($input.params('id'))"}` |
+| `GET /orders` | `orders-search` | `{"customerId": "$util.escapeJavaScript($input.params('customerId'))"}` |
+| `POST /orders` | `orders-create` | `$input.json('$')` (body passed through) |
+
+### Error routing
+
+With non-proxy integration, API Gateway selects the HTTP status by matching a
+**regex against the Lambda `errorMessage`**. If no pattern matches, the
+*default* response (200) is used, so an unmapped error would reach the client
+as `200 OK`. To make routing reliable, `OrderFunctions` translates domain
+exceptions into a `FunctionError` whose message starts with a contract error
+code:
+
+```
+[ORDER_NOT_FOUND] Order ORD-999 does not exist
+[INVALID_REQUEST] quantity must be an integer greater than or equal to 1
+[INTERNAL_ERROR] Unexpected error
+```
+
+`OrderService` remains unaware of this convention.
+
+| Integration response regex | Status | Response mapping |
+|---|---|---|
+| *(default)* | 200 / 201 | Lambda result passed through (`POST` overrides status to 201 and adds `Location`) |
+| `^\[ORDER_NOT_FOUND\].*` | 404 | `{"error": "ORDER_NOT_FOUND", "message": <message without prefix>}` |
+| `^\[INVALID_REQUEST\].*\|.*JSON parsing.*` | 400 | `{"error": "INVALID_REQUEST", "message": ...}` |
+| `^\[INTERNAL_ERROR\].*` | 500 | `{"error": "INTERNAL_ERROR", "message": "An unexpected error occurred"}` |
+
+The `.*JSON parsing.*` alternative is required because type errors
+(`"quantity": "two"`) fail during Lambda deserialization, before our code runs,
+so they never carry our prefix.
+
+`POST /orders` default response template:
+```
+#set($context.responseOverride.status = 201)
+#set($context.responseOverride.header.Location = "/orders/$input.path('$.id')")
+$input.json('$')
+```
+
+Error templates (e.g. 400):
+```
+#set($raw = $input.path('$.errorMessage'))
+#if($raw.startsWith('['))
+#set($start = $raw.indexOf(']') + 2)
+#set($msg = $raw.substring($start))
+#else
+#set($msg = "Request body is not valid JSON or has fields with invalid types")
+#end
+{
+  "error": "INVALID_REQUEST",
+  "message": "$util.escapeJavaScript($msg)"
+}
+```
+
+Only `error` and `message` are copied, so Lambda's `stackTrace` is never exposed.
+
+### Example requests and responses
+
+Base URL: `https://rn8nmyawrh.execute-api.us-east-1.amazonaws.com/dev`
+
+| Request | Status | Body |
+|---|---|---|
+| `GET /orders/ORD-001` | `200 OK` | `{"id":"ORD-001","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+| `GET /orders/ORD-999` | `404 Not Found` | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-999 does not exist"}` |
+| `GET /orders?customerId=CUST-42` | `200 OK` | `[{"id":"ORD-001",...},{"id":"ORD-002",...}]` |
+| `GET /orders?customerId=CUST-100` | `200 OK` | `[]` |
+| `GET /orders` | `400 Bad Request` | `{"error":"INVALID_REQUEST","message":"customerId is required"}` |
+| `POST /orders` ([body](examples/create-order.json)) | `201 Created` + `Location: /orders/ORD-00X` | `{"id":"ORD-00X","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+| `POST /orders` ([body](examples/create-order-invalid.json)) | `400 Bad Request` | `{"error":"INVALID_REQUEST","message":"quantity must be an integer greater than or equal to 1"}` |
+| `POST /orders` ([body](examples/create-order-wrong-type.json)) | `400 Bad Request` | `{"error":"INVALID_REQUEST","message":"Request body is not valid JSON or has fields with invalid types"}` |
+
+```bash
+curl -i "https://rn8nmyawrh.execute-api.us-east-1.amazonaws.com/dev/orders/ORD-001"
+curl -i -X POST "https://rn8nmyawrh.execute-api.us-east-1.amazonaws.com/dev/orders" \
+     -H "Content-Type: application/json" --data-binary "@examples/create-order.json"
+```
+
+> Because each method has its own Lambda (and its own memory), an order created
+> with `POST /orders` is not visible from `GET /orders/{id}`: only the sample
+> orders are shared. This is a direct consequence of non-persistent in-memory storage.
+
+### Checkpoint 3 — What is API Gateway responsible for?
+
+In Architecture A, API Gateway is responsible for:
+
+- **Routing:** mapping `METHOD + path` to a specific Lambda function.
+- **Extracting path parameters:** `{id}` via `$input.params('id')`.
+- **Extracting query parameters:** `customerId` via `$input.params('customerId')`.
+- **Transforming requests:** building the exact JSON each function expects.
+- **Transforming responses:** reshaping Lambda errors into the contract's error format.
+- **Choosing status codes:** 200 by default, 201 via `responseOverride`, 400/404/500 via selection patterns.
+- **Mapping errors:** regex over `errorMessage`, including deserialization errors.
+- **Hiding internals:** dropping `stackTrace` and `errorType`.
+- **Setting headers:** `Location` on creation.
+
+**Advantages**
+- The Java code knows nothing about HTTP: `OrderService` and `OrderFunctions` have no status codes, headers or AWS classes.
+- Each Lambda receives a small, purpose-specific input (`{"id": ...}`).
+- HTTP behavior (status mapping, response shape) can be changed by redeploying the API, without rebuilding the JAR.
+- The HTTP contract is declared explicitly in the gateway (method responses list the allowed status codes).
+
+**Disadvantages**
+- **Behavior is split** between Java code and gateway configuration. To understand what `GET /orders` returns, you must read both.
+- **Mapping templates (VTL) cannot be tested locally** with `mvn test`. A template bug (arithmetic inside a method argument) was only discovered in AWS.
+- **Error routing is string-based:** a regex over `errorMessage`, with one regex per status code. This forced a message-prefix convention (`[CODE]`), so the Java side still has to know a gateway convention; it is coupling, just hidden in strings.
+- **Unsafe default:** an error matching no pattern is returned as `200 OK`.
+- **Repetitive configuration:** every method repeats method responses, integration responses and templates. With 3 operations this is already about 15 manual console steps.
+- **Configuration lives in the console**, not in source control, unless it is explicitly exported (as done here). Manual steps are error-prone; during the workshop a template was accidentally edited on the wrong method.
+- **One Lambda per method** means no shared in-memory state between operations.
