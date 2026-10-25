@@ -442,3 +442,31 @@ decisions and HTTP translation stay in versioned, testable code. This matches th
 idea that the gateway protects and routes while services own business decisions.
 Architecture A remains useful for small, stable transformations or when
 integrating API Gateway directly with AWS services without writing a Lambda.
+
+## Final Challenge — DELETE /orders/{id}
+
+### My prediction (committed before implementation)
+
+- **Which Java classes should change?**
+
+Probably the service, as there's nothing there to allow you to delete currently, and `OrdersApiHandler` and something in the lambda folder depending on the architecture. Also, the exceptions to handle errors when deleting things.
+
+- **Do you need a new Lambda function?** 
+
+Yes, in the class `OrderFunctions`, we need to add a method for deletion.
+
+- **Does API Gateway configuration need to change?** 
+
+We need to add the DELETE method on the resources part.
+
+- **Where should the deletion logic reside?** 
+
+On the service, as that is the responsibility of that class.
+
+- **Where should the decision to return `204` or `404` reside?** 
+
+In AWS.
+
+- **Which tests should be added?** 
+
+Multiple ones to test different cases when you try to delete things, to prove you can successfully delete, but also what happens when you try to delete something that doesn't exist and so on.
