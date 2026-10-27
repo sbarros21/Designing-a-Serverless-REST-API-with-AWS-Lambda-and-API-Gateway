@@ -524,42 +524,6 @@ flowchart TD
 Architecture A (`orders-api-mapping`, mapping templates + `OrderFunctions`) is still
 deployed for comparison; see Part III & IV.
 
-## Final Architecture
-
-```mermaid
-flowchart TD
-    C["Client<br/>(curl / Postman)"]
-
-    subgraph AWS["AWS-managed services"]
-        GW["Amazon API Gateway<br/>REST API orders-api-proxy<br/>(Lambda proxy integration)"]
-        L["AWS Lambda<br/>function orders-api<br/>Java 17 runtime"]
-    end
-
-    subgraph ADAPTER["Depends on AWS libraries (package http)"]
-        H["OrdersApiHandler<br/>routing · parameter extraction · JSON<br/>status codes · headers"]
-    end
-
-    subgraph JAVA["Plain Java (no AWS, no HTTP)"]
-        S["OrderService<br/>business rules · validation"]
-        R["OrderRepository<br/>InMemoryOrderRepository"]
-        M["Order · CreateOrderRequest"]
-    end
-
-    C -- "HTTPS request<br/>POST/GET/DELETE /orders..." --> GW
-    GW -- "proxy event (JSON)" --> L
-    L -- "APIGatewayProxyRequestEvent" --> H
-    H -- "Java method calls" --> S
-    S --> R
-    S -.uses.-> M
-    H -- "APIGatewayProxyResponseEvent<br/>{statusCode, headers, body}" --> L
-    L --> GW
-    GW -- "HTTP response<br/>200/201/204/400/404/500" --> C
-```
-
-- **AWS-managed:** API Gateway and the Lambda runtime.
-- **Depends on AWS:** only `OrdersApiHandler` (and `ErrorResponse`) in the `http` package.
-- **Ordinary Java:** `OrderService`, the repository and the model. They are unchanged
-  since Part I and fully tested with `mvn test`.
 
 ## AI-Assisted Development — Criticizing the Agent
 
@@ -668,6 +632,3 @@ mvn package    # builds target/orders-api-1.0-SNAPSHOT.jar (fat JAR via shade)
 
 **Clean up:** delete both REST APIs, the four Lambda functions and their
 CloudWatch log groups (`/aws/lambda/orders-*`).
-
-Architecture A (`orders-api-mapping`, mapping templates + `OrderFunctions`) is still
-deployed for comparison; see Part III & IV.
