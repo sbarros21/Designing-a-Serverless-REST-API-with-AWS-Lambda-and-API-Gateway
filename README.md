@@ -523,3 +523,151 @@ flowchart TD
 
 Architecture A (`orders-api-mapping`, mapping templates + `OrderFunctions`) is still
 deployed for comparison; see Part III & IV.
+
+## Final Architecture
+
+```mermaid
+flowchart TD
+    C["Client<br/>(curl / Postman)"]
+
+    subgraph AWS["AWS-managed services"]
+        GW["Amazon API Gateway<br/>REST API orders-api-proxy<br/>(Lambda proxy integration)"]
+        L["AWS Lambda<br/>function orders-api<br/>Java 17 runtime"]
+    end
+
+    subgraph ADAPTER["Depends on AWS libraries (package http)"]
+        H["OrdersApiHandler<br/>routing · parameter extraction · JSON<br/>status codes · headers"]
+    end
+
+    subgraph JAVA["Plain Java (no AWS, no HTTP)"]
+        S["OrderService<br/>business rules · validation"]
+        R["OrderRepository<br/>InMemoryOrderRepository"]
+        M["Order · CreateOrderRequest"]
+    end
+
+    C -- "HTTPS request<br/>POST/GET/DELETE /orders..." --> GW
+    GW -- "proxy event (JSON)" --> L
+    L -- "APIGatewayProxyRequestEvent" --> H
+    H -- "Java method calls" --> S
+    S --> R
+    S -.uses.-> M
+    H -- "APIGatewayProxyResponseEvent<br/>{statusCode, headers, body}" --> L
+    L --> GW
+    GW -- "HTTP response<br/>200/201/204/400/404/500" --> C
+```
+
+- **AWS-managed:** API Gateway and the Lambda runtime.
+- **Depends on AWS:** only `OrdersApiHandler` (and `ErrorResponse`) in the `http` package.
+- **Ordinary Java:** `OrderService`, the repository and the model. They are unchanged
+  since Part I and fully tested with `mvn test`.
+
+## AI-Assisted Development — Criticizing the Agent
+
+I used Claude as an engineering assistant throughout the workshop. These are
+non-trivial decisions it made or proposed, and my evaluation of each.
+
+### 1. One Lambda per operation (A) vs. one Lambda for the whole API (B)
+
+- **Decision made by the agent:** In Architecture A, create three functions
+  (`orders-create`, `orders-get`, `orders-search`) from the same JAR with
+  different handlers. In B, a single `orders-api` function with a router.
+- **Why do I think it proposed this?** Non-proxy integration maps each API
+  method to one function, and each function can only have one handler method.
+  With proxy integration the whole HTTP request arrives, so one function can route.
+- **Do I agree?** Partially. It matched each integration style, but in A it
+  introduced a real problem: the functions do not share memory, so an order
+  created by `POST` could not be read by `GET`. The agent warned about it, but
+  it was a direct consequence of its design.
+- **Alternative:** In A, a single function receiving an `"action"` field from
+  the mapping template; or a real database (DynamoDB) shared by all functions.
+- **What I implemented and why:** Both, as proposed: A with three functions to
+  show the trade-off, B with one function. For a larger system I would split
+  Lambdas by bounded context, not per operation and not one for everything.
+
+### 2. Error routing with a `[CODE]` prefix in the exception message
+
+- **Decision made by the agent:** In A, `OrderFunctions` catches domain
+  exceptions and rethrows `FunctionError("[ORDER_NOT_FOUND] ...")`, so API
+  Gateway can select the status code with regexes like `^\[ORDER_NOT_FOUND\].*`.
+- **Why do I think it proposed this?** API Gateway can only match a regex
+  against `errorMessage`; unmatched errors fall back to the default 200 response,
+  and a catch-all pattern is unsafe because evaluation order is undefined.
+  AWS documents this prefix pattern.
+- **Do I agree?** Yes, given the constraint. It is more robust than matching
+  free text like `.*does not exist.*`. But it is still string-based coupling:
+  the Java side must know a gateway convention.
+- **Alternative:** Match the domain messages directly (fragile), or return a
+  JSON-encoded error object in `errorMessage` and parse it with `$util.parseJson`.
+- **What I implemented and why:** The prefix, translated in `OrderFunctions` and
+  not in `OrderService`, so the business logic stayed unaware of API Gateway.
+
+### 3. Validation location: business logic vs. API Gateway
+
+- **Decision made by the agent:** All validation (`customerId`, `product`,
+  `quantity`, missing query parameter) lives in `OrderService`. The `customerId`
+  query parameter was *not* marked as required in API Gateway.
+- **Why do I think it proposed this?** To keep a single, unit-tested source of
+  truth and a consistent error format. API Gateway's request validator returns
+  its own error body, not our contract's.
+- **Do I agree?** Yes. The cost is that invalid requests still invoke Lambda.
+- **Alternative:** API Gateway request validators / JSON Schema models, which
+  reject bad input at the edge, at the price of a different error format and
+  rules that cannot be tested with `mvn test`.
+- **What I implemented and why:** Validation in the service, as proposed.
+  Type errors in the JSON (`"quantity": "two"`) are the exception: they are
+  caught by deserialization (Lambda runtime in A, Jackson in B) before reaching
+  the service, and are also mapped to 400.
+
+### 4. Mapping templates proposed by the agent were not always correct
+
+- **Decision made by the agent:** It wrote the 404 response template using
+  `$raw.substring($raw.indexOf(']') + 2)`. Later, it worked around a console
+  limitation by forcing `201` with `$context.responseOverride.status` inside a template.
+- **Why do I think it proposed this?** It reasoned as if VTL behaved like Java;
+  it does not allow arithmetic inside method arguments.
+- **Do I agree?** No for the first one: the template failed in AWS with a
+  generic `500 Internal server error`, and it was only fixed (computing the
+  index first with `#set`) after testing. The second one works, but it hides
+  the status code inside a template instead of the visible method configuration.
+- **Alternative:** Architecture B, where the same logic is Java and is tested
+  locally; in that case the error would have been caught by `mvn test`.
+- **What I implemented and why:** The corrected template and the
+  `responseOverride`. This experience is one of the strongest arguments in my
+  comparison: VTL logic cannot be tested locally, and errors only appear once deployed.
+
+### 5. `DELETE` on a missing order returns 404 (not 204)
+
+- **Decision made by the agent:** The second `DELETE` of the same order returns `404`.
+- **Why do I think it proposed this?** To let clients know whether the
+  resource existed, reusing `OrderNotFoundException`.
+- **Do I agree?** Yes, and it is still idempotent in effect: the server state
+  after one or many calls is the same.
+- **Alternative:** Always return `204`, which is simpler for clients that
+  retry and do not care whether the order existed.
+- **What I implemented and why:** `404`, consistent with `GET` of a missing order.
+
+## Build & Test Instructions
+
+**Prerequisites:** JDK 17+ (built with `release 17`), Maven 3.8+, Git.
+
+```bash
+mvn test       # runs all unit tests (no AWS needed)
+mvn package    # builds target/orders-api-1.0-SNAPSHOT.jar (fat JAR via shade)
+```
+
+**Deploy (summary):**
+1. Create Lambda functions (Java 17, role `LabRole`) and upload the JAR:
+    - Architecture A: `orders-create`, `orders-get`, `orders-search` with handlers
+      `co.edu.escuelaing.orders.lambda.OrderFunctions::createOrder | ::getOrder | ::findOrdersByCustomer`.
+    - Architecture B: `orders-api` with handler
+      `co.edu.escuelaing.orders.http.OrdersApiHandler::handleRequest` (timeout 10 s).
+2. Import the API definitions from `docs/api-gateway/` (API Gateway →
+   Create API → REST API → Import), or recreate them as described in
+   Part III & IV and Part V. Then deploy to stage `dev`.
+3. Test with the `curl` commands in this README and the bodies in `examples/`.
+
+**Clean up:** delete both REST APIs, the four Lambda functions and their
+CloudWatch log groups (`/aws/lambda/orders-*`).
+
+Architecture A (`orders-api-mapping`, mapping templates + `OrderFunctions`) is still
+deployed for comparison; see Part III & IV.
