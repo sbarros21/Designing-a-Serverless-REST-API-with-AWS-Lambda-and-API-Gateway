@@ -1,6 +1,6 @@
 # Designing-a-Serverless-REST-API-with-AWS-Lambda-and-API-Gateway
 
-## 1. API Contract
+## API Design
 
 ### Order representation
 ```json
@@ -64,6 +64,16 @@ Validation rules:
 | Success | `200 OK` + list of orders (may be `[]`) |
 | Errors | `400 INVALID_REQUEST` (if `customerId` is missing), `500 INTERNAL_ERROR` |
 
+#### Delete an order
+| | |
+|---|---|
+| Method / URL | `DELETE /orders/{id}` |
+| Path params | `id`: order identifier |
+| Query params | — |
+| Request body | — |
+| Success | `204 No Content` (no body) |
+| Errors | `404 ORDER_NOT_FOUND`, `500 INTERNAL_ERROR` |
+
 > Note: data is stored in memory. Lambda may recycle its execution environment
 > at any time, so this is **not** persistent storage. A few sample orders are
 > preloaded so the GET operations can always be tested.
@@ -103,7 +113,9 @@ or internal details. As an improvement, it could include a `traceId` to correlat
 error with logs.
 
 
-## 2. Checkpoint 1 — Plain Java application
+## Part I — Plain Java Application
+
+### Checkpoint 1
 
 **Can the application functionality be tested without AWS?**
 Yes. `OrderService` is plain Java and is fully tested with JUnit (`mvn test`),
@@ -126,26 +138,48 @@ None. Business outcomes are expressed with domain exceptions
 Translating them into HTTP responses will be the responsibility of a later
 layer (API Gateway or an HTTP adapter).
 
-Verified against the deployed function (`orders-create`):
-
-| Event | Result | Conclusion |
-|---|---|---|
-| `{"customerId":"CUST-42","product":"MacBook Air","quantity":1}` | `{"id":"ORD-004",...}` (with *Init duration* ≈ 385 ms) | JSON → `CreateOrderRequest` → `Order` → JSON. First call was a cold start. |
-| `{"customerId":"CUST-100","product":"Monitor","quantity":3}` | `{"id":"ORD-004",...}` | The execution environment had been recycled: in-memory data was reset to the sample orders. |
-| `{"customerId":"CUST-1","product":"Mouse","quantity":1,"color":"red"}` | `{"id":"ORD-005",...}` | Unknown JSON properties are silently ignored. The environment was warm, so the counter was preserved. |
-| `{"customerId":"CUST-42","product":"MacBook Air","quantity":0}` | `errorType: InvalidOrderException`, `errorMessage: "quantity must be..."`, full `stackTrace` | Exceptions thrown by our code become a Lambda error document. The stack trace (`Method.invoke`) confirms the handler is invoked via reflection. It also exposes internals, so it must not reach API clients as-is. |
-| `{"customerId":"CUST-1","product":"Mouse","quantity":"two"}` | `errorType: RuntimeException`, `errorMessage: "An error occurred during JSON parsing"`, empty `stackTrace` | Deserialization fails **before** our code runs; our validation is never reached. Type errors and business validation errors are reported differently. |
-
-**Conclusion:** the Lambda Java runtime acts as an automatic JSON adapter. It
-deserializes the event into the handler's parameter type by matching property
-names (ignoring unknown ones and leaving missing ones as `null`), invokes the
-method via reflection, and serializes the return value with its getters.
-Errors, whether from our code or from deserialization, are returned as an
-`errorMessage` / `errorType` / `stackTrace` document. Because the execution
-environment can be recycled at any time, the in-memory repository is not
-persistent storage.
 
 ## Part II — AWS Lambda
+
+Three Lambda functions were created from the same JAR, each pointing to a
+different handler method:
+
+| Function | Handler |
+|---|---|
+| `orders-create` | `co.edu.escuelaing.orders.lambda.OrderFunctions::createOrder` |
+| `orders-get` | `co.edu.escuelaing.orders.lambda.OrderFunctions::getOrder` |
+| `orders-search` | `co.edu.escuelaing.orders.lambda.OrderFunctions::findOrdersByCustomer` |
+
+Runtime: Java 17 · Role: `LabRole` · Region: `us-east-1`.
+`OrderFunctions` has no AWS dependencies: it is a thin, plain-Java entry point
+that delegates to `OrderService`.
+
+### How does the Lambda Java runtime convert JSON ↔ Java?
+
+1. Lambda receives the event as raw JSON bytes.
+2. Using reflection, the runtime reads the handler signature (`Class::method`)
+   to find the declared parameter type.
+3. A built-in JSON serializer deserializes the event into that type, using the
+   public no-arg constructor and setters and matching fields by name.
+4. The method is invoked, and its return value is serialized back to JSON using
+   its getters (a `List<Order>` becomes a JSON array).
+5. If the method throws, Lambda returns an error document with `errorMessage`,
+   `errorType` and `stackTrace`.
+
+### Checkpoint 2 — Actual solution
+
+```mermaid
+flowchart TD
+    E["Test event (JSON)<br/>{customerId, product, quantity}"] --> R
+    R["AWS Lambda Java 17 runtime<br/>(JSON → CreateOrderRequest)"] --> F
+    F["OrderFunctions.createOrder<br/>(plain Java entry point)"] --> S
+    S["OrderService.createOrder<br/>(application logic)"] --> Repo["InMemoryOrderRepository"]
+    S -->|Order| F
+    F -->|Order| R2["AWS Lambda runtime<br/>(Order → JSON)"]
+    R2 --> O["Response (JSON)<br/>{id, customerId, product, quantity}"]
+```
+
+### Experiments
 
 Verified against the deployed function (`orders-create`):
 
@@ -292,7 +326,7 @@ In Architecture A, API Gateway is responsible for:
 
 ## Part V — Lambda Proxy Integration (Architecture B)
 
-REST API `orders-api-proxy` (Regional), stage `dev`. All three methods use
+REST API `orders-api-proxy` (Regional), stage `dev`. All methods use
 **Lambda proxy integration** with a **single** Lambda function, `orders-api`
 (handler `co.edu.escuelaing.orders.http.OrdersApiHandler::handleRequest`,
 Java 17, timeout 10 s).
@@ -337,13 +371,14 @@ status codes, headers and JSON. It:
 1. **routes** by `httpMethod` + `resource`;
 2. **extracts** `pathParameters`, `queryStringParameters` and parses `body` with Jackson;
 3. **calls** `OrderService`;
-4. **translates** the outcome: success → 200/201 (+ `Location`),
+4. **translates** the outcome: success → 200/201 (+ `Location`) / 204,
    `InvalidOrderException` or malformed JSON → 400,
    `OrderNotFoundException` → 404, anything else → 500 (logged, never exposed).
 
-`OrderService`, the repository and the model were **not modified**. All HTTP
-behavior is covered by `OrdersApiHandlerTest` (13 tests, no AWS needed),
-including the 500 case, which could not be tested locally in Architecture A.
+`OrderService`, the repository and the model were **not modified** to introduce
+the proxy architecture. All HTTP behavior is covered by `OrdersApiHandlerTest`
+(17 tests, no AWS needed), including the 500 case, which could not be tested
+locally in Architecture A.
 
 ### Example requests and responses
 
@@ -380,7 +415,7 @@ while the execution environment stays warm. It is still not persistent.
 Architecture A, by far. Each method needed a request mapping template, declared
 method responses, one integration response per status code with a regex over
 `errorMessage`, and a response template for each one. Architecture B needed only
-the resources and three methods with the proxy toggle enabled. The exported
+the resources and the methods with the proxy toggle enabled. The exported
 OpenAPI file of B is much shorter than A's.
 
 **Which approach required more Java infrastructure code?**
@@ -402,7 +437,7 @@ method call) was only discovered there.
   `$context.responseOverride.status` in a template. The Java code only emits a
   `[CODE]` prefix that the gateway interprets.
 - **B:** in Java, in `OrdersApiHandler.handleRequest` (exception → status) and
-  in each operation (`json(201, ...)`).
+  in each operation (`json(201, ...)`, `204` on delete).
 
 **What happens if the API grows from 3 operations to 30?**
 - **A:** configuration grows linearly and manually: about 30 request templates and
@@ -443,6 +478,7 @@ idea that the gateway protects and routes while services own business decisions.
 Architecture A remains useful for small, stable transformations or when
 integrating API Gateway directly with AWS services without writing a Lambda.
 
+
 ## Final Challenge — DELETE /orders/{id}
 
 ### My prediction (committed before implementation)
@@ -451,26 +487,48 @@ integrating API Gateway directly with AWS services without writing a Lambda.
 
 Probably the service, as there's nothing there to allow you to delete currently, and `OrdersApiHandler` and something in the lambda folder depending on the architecture. Also, the exceptions to handle errors when deleting things.
 
-- **Do you need a new Lambda function?** 
+- **Do you need a new Lambda function?**
 
 Yes, in the class `OrderFunctions`, we need to add a method for deletion.
 
-- **Does API Gateway configuration need to change?** 
+- **Does API Gateway configuration need to change?**
 
 We need to add the DELETE method on the resources part.
 
-- **Where should the deletion logic reside?** 
+- **Where should the deletion logic reside?**
 
 On the service, as that is the responsibility of that class.
 
-- **Where should the decision to return `204` or `404` reside?** 
+- **Where should the decision to return `204` or `404` reside?**
 
 In AWS.
 
-- **Which tests should be added?** 
+- **Which tests should be added?**
 
 Multiple ones to test different cases when you try to delete things, to prove you can successfully delete, but also what happens when you try to delete something that doesn't exist and so on.
 
+### Agent's proposal vs. my prediction
+
+Implemented in Architecture B only.
+
+| Question | My prediction | Agent's proposal / final implementation | Comparison |
+|---|---|---|---|
+| Java classes that change | Service, `OrdersApiHandler`, something in `lambda`, new exceptions | `OrderRepository` + `InMemoryOrderRepository` (`deleteById`), `OrderService.deleteOrder`, `OrdersApiHandler` (new route). `OrderNotFoundException` reused; `OrderFunctions` unchanged | I missed the repository layer: deletion also needs a storage operation. No new exception was needed. `lambda` only changes for Architecture A. |
+| New Lambda function? | Yes, a method in `OrderFunctions` | No. The single `orders-api` function routes all operations; only the JAR was redeployed | I mixed up a new handler *method* with a new Lambda *function*. In Architecture A it would indeed need a new function. |
+| API Gateway changes? | Add a `DELETE` method | Add `DELETE` on `/orders/{id}` (proxy to `orders-api`) and redeploy | Matches. With a `{proxy+}` / `ANY` route it would not be necessary. |
+| Deletion logic | `OrderService` | `OrderService` (business rule), delegating removal to the repository | Matches. |
+| 204 vs 404 decision | "In AWS" | The **service** decides the outcome (deleted vs. not found); the **HTTP adapter** (`OrdersApiHandler`) translates it to 204/404 | Partially. In B it is Java code running in Lambda, not API Gateway configuration. The business outcome and its HTTP translation are separate responsibilities. |
+| Tests | Success, nonexistent order, etc. | Service: delete existing, delete missing, blank id, removed from search. Handler: 204 without body, 404 for missing, 404 on second delete, GET 404 after delete | Matches in spirit; the final tests are more specific. |
+
+**Idempotency:** `DELETE` is idempotent in its *effect*, but our API returns
+`204` the first time and `404` afterwards, so clients can tell whether the order
+existed. Always returning `204` would be an equally valid choice.
+
+| Request | Status | Body |
+|---|---|---|
+| `DELETE /orders/ORD-001` | `204 No Content` | *(empty)* |
+| `GET /orders/ORD-001` (after delete) | `404 Not Found` | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-001 does not exist"}` |
+| `DELETE /orders/ORD-999` | `404 Not Found` | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-999 does not exist"}` |
 
 ### Observed while deploying
 
@@ -518,8 +576,7 @@ flowchart TD
 
 - **AWS-managed:** API Gateway and the Lambda runtime.
 - **Depends on AWS:** only `OrdersApiHandler` (and `ErrorResponse`) in the `http` package.
-- **Ordinary Java:** `OrderService`, the repository and the model. They are unchanged
-  since Part I and fully tested with `mvn test`.
+- **Ordinary Java:** `OrderService`, the repository and the model, fully tested with `mvn test`.
 
 Architecture A (`orders-api-mapping`, mapping templates + `OrderFunctions`) is still
 deployed for comparison; see Part III & IV.
@@ -609,6 +666,7 @@ non-trivial decisions it made or proposed, and my evaluation of each.
 - **Alternative:** Always return `204`, which is simpler for clients that
   retry and do not care whether the order existed.
 - **What I implemented and why:** `404`, consistent with `GET` of a missing order.
+
 
 ## Build & Test Instructions
 
